@@ -1,2 +1,6 @@
 .venv
 /dataset 
+video.mp4
+*.pyc
+__pycache__/
+*.pkl
