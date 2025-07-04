@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import cv2
 import json
-from fm_solvers import FlowDPMSolverMultistepScheduler
+from diffusers import UniPCMultistepScheduler
 
 # Custom Dataset for Video Clips
 class DragonBallVideoDataset(Dataset):
@@ -16,7 +16,7 @@ class DragonBallVideoDataset(Dataset):
             self.metadata = json.load(f)
         self.transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Resize((480, 854))  # Match Wan 2.1 T2V-1.3B input (480p)
+            transforms.Resize((480, 854))  # Match Wan 2.1 I2V-14B input (480p)
         ])
 
     def __len__(self):
@@ -37,10 +37,16 @@ class DragonBallVideoDataset(Dataset):
         cap.release()
         return {"frames": torch.stack(frames), "caption": caption}
 
+gpu_index = int(os.environ.get("LORA_GPU", 0))
+#make sure to run the command  LORA_GPU=1 python train_lora.py
+device = f"cuda:{gpu_index}" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
 # Load Model, VAE, and Configure LoRA
-base_model = "./Wan2.1-T2V-1.3B"
-vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae", torch_dtype=torch.float16).to("cuda")
-pipeline = DiffusionPipeline.from_pretrained(base_model, torch_dtype=torch.float16).to("cuda")
+base_model = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+pipeline = DiffusionPipeline.from_pretrained(base_model, torch_dtype=torch.float16)
+pipeline.to(device)
+vae = pipeline.vae  # Use the VAE from the pipeline
+
 lora_config = LoraConfig(
     r=64,
     lora_alpha=32,
@@ -52,15 +58,20 @@ pipeline.unet = get_peft_model(pipeline.unet, lora_config)
 lora_layers = filter(lambda p: p.requires_grad, pipeline.unet.parameters())
 
 # Text Encoder
-text_encoder = pipeline.text_encoder.to("cuda")
+text_encoder = pipeline.text_encoder.to(device)
 
 # Scheduler
-scheduler = FlowDPMSolverMultistepScheduler(
+scheduler = UniPCMultistepScheduler(
+    beta_start=0.0001,
+    beta_end=0.02,
+    beta_schedule="linear",
     num_train_timesteps=1000,
     solver_order=2,
+    solver_type="bh2",
     prediction_type="flow_prediction",
-    shift=1.0,
-    use_dynamic_shifting=False
+    flow_shift=3.0,
+    timestep_spacing="linspace",
+    use_flow_sigmas=True
 )
 scheduler.set_timesteps(num_inference_steps=50, device="cuda")  # Adjust steps as needed
 
@@ -69,13 +80,14 @@ dataset = DragonBallVideoDataset(
     data_dir="dataset/10_dragonball",
     metadata_file="dataset/10_dragonball/metadata.json"
 )
-dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+dataloader = DataLoader(dataset, batch_size=2, shuffle=True) #ram eater line 
 
 # Loss Computation Function
 def compute_loss(model, vae, scheduler, x_0, t, noise, text_embeds, device="cuda"):
     with torch.no_grad():
         x_0_latent = vae.encode(x_0).latent_dist.sample()
 
+    # Timestep embedding for noise scaling
     def get_timestep_embedding(timesteps, embedding_dim):
         half_dim = embedding_dim // 2
         emb = torch.log(10000) / (half_dim - 1)
@@ -87,14 +99,15 @@ def compute_loss(model, vae, scheduler, x_0, t, noise, text_embeds, device="cuda
     noise_scale = get_timestep_embedding(t, x_0_latent.shape[1]).unsqueeze(0).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
     x_t = x_0_latent + noise * noise_scale
 
-    pred_noise = model(x_t, t, text_embeds).sample
+    # Noise prediction
+    model_output = model(x_t, t, text_embeds)
+    pred_noise = model_output.sample if hasattr(model_output, 'sample') else model_output
     noise_loss = torch.nn.functional.mse_loss(pred_noise, noise, reduction='mean')
 
-    # Flow Matching Loss
-    sigma_t = scheduler.sigmas[scheduler.step_index].to(device)
-    model_output = model(x_t, t, text_embeds)
-    flow_pred = scheduler.convert_model_output(model_output, sample=x_t)
-    v_star = noise / sigma_t  # Simplified optimal vector field (placeholder; adjust based on Wan specifics), How can I get this, dont forget to change it 
+    # Flow Matching Loss with UniPC adjustments
+    sigma_t = scheduler.sigmas[t].to(device)  # Use scheduler sigmas directly for the timestep
+    flow_pred = scheduler.convert_model_output(model_output, sample=x_t, timestep=t)
+    v_star = noise / (sigma_t * scheduler.config.flow_shift)  # Adjusted for flow_shift
     flow_loss = torch.nn.functional.mse_loss(flow_pred, v_star, reduction='mean')
 
     total_loss = noise_loss + 0.1 * flow_loss  # Weight flow loss (adjust as needed)
@@ -102,7 +115,7 @@ def compute_loss(model, vae, scheduler, x_0, t, noise, text_embeds, device="cuda
 
 # Training Loop
 optimizer = torch.optim.AdamW(lora_layers, lr=1e-4)
-num_epochs = 2 #experiment on this one 
+num_epochs = 2  # Experiment on this one
 for epoch in range(num_epochs):
     for batch in dataloader:
         frames, captions = batch["frames"].to("cuda"), batch["caption"]

@@ -10,10 +10,11 @@ metadata_file = "dataset/10_dragonball/metadata.json"
 output_metadata = "dataset/10_dragonball/updated_metadata.json"
 frames_per_clip = 5  # One frame per second for a 5-second clip
 
+gpu_index = int(os.environ.get("BLIP2_GPU", 0))
 # Load BLIP-2 model
 processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
 model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-opt-2.7b", torch_dtype=torch.float16).to("cuda")
-
+print("script started")
 # Load existing metadata
 with open(metadata_file, 'r') as f:
     metadata = json.load(f)
@@ -23,6 +24,9 @@ new_metadata = []
 for item in metadata:
     video_path = os.path.join(clips_dir, item['file_name'])
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error opening video file {video_path}")
+        continue
     fps = cap.get(cv2.CAP_PROP_FPS)
     frame_interval = int(fps) if fps > 0 else 24  # Default to 24 FPS if unavailable
     frames = []
